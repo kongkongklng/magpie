@@ -1,0 +1,51 @@
+name: Build Magpie for macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'internal/gateway/**'
+      - 'internal/provider/**'
+      - '.github/workflows/build-macos.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run gateway and provider tests
+        run: go test ./internal/provider ./internal/gateway
+
+      - name: Build macOS app
+        run: make app
+
+      - name: Identify architecture
+        run: |
+          echo "Runner architecture: $(uname -m)"
+          file magpie.app/Contents/MacOS/magpie
+
+      - name: Package app
+        run: ditto -c -k --sequesterRsrc --keepParent magpie.app magpie-macos.zip
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: magpie-macos-${{ runner.arch }}
+          path: magpie-macos.zip
+          if-no-files-found: error
+          retention-days: 14
