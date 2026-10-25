@@ -24,6 +24,7 @@ const (
 	xaiCompactionRefusal = `{"code":"invalid-argument","error":"Could not decode the compaction blob. Ensure it is unmodified from the compact response."}`
 	xaiUnknownCustom     = `Failed to deserialize the JSON body into the target type: tools[6].type: unknown variant ` + "`custom`" + `, expected one of ` + "`function`" + `, ` + "`web_search`" + `, ` + "`shell`" + `, ` + "`tool_search`"
 	xaiInvalidRole       = `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid request content: Invalid message role."}}`
+	xaiNullRequired      = `{"type":"error","error":{"type":"invalid_request_error","message":"xAI: Invalid request content: Schema validation failed: [standard_violation] /required: null is not of type \"array\""}}`
 )
 
 // The reporter's second turn: Codex's replay of the sealed reasoning item
@@ -109,6 +110,9 @@ func TestXAITakesCodexsSealedReasoningBack(t *testing.T) {
 		}
 		if !bytes.Contains(f.got, []byte(`"encrypted_content":"gAABblob"`)) || !bytes.Contains(f.got, []byte(`"rs_1"`)) {
 			t.Errorf("sealed reasoning not replayed as it came: %s", f.got)
+		}
+		if !bytes.Contains(f.got, []byte(`"required":[]`)) {
+			t.Errorf("tool without required did not get an empty array: %s", f.got)
 		}
 	}
 }
@@ -201,7 +205,60 @@ func TestXAIFoldsClaudesSystemTurn(t *testing.T) {
 	}
 }
 
-// A body xAI takes is passed through untouched: the two shapers change
+// Claude Code offers no-argument tools with no required field at their
+// schema root (CronList and EnterPlanMode among them). xAI reads the
+// missing field as null and refuses the request, so each gets the empty
+// array that requires nothing (#3392).
+func TestXAITakesClaudesToolWithoutRequired(t *testing.T) {
+	f := &fake{t: t, reply: sse(
+		`event: message_start`+"\n"+`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"grok-4.7","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`event: content_block_delta`+"\n"+`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+		`event: content_block_stop`+"\n"+`data: {"type":"content_block_stop","index":0}`,
+		`event: message_delta`+"\n"+`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`,
+		`event: message_stop`+"\n"+`data: {"type":"message_stop"}`)}
+	f.refuse = func(body []byte) (int, string) {
+		var q struct {
+			Tools []struct {
+				InputSchema map[string]json.RawMessage `json:"input_schema"`
+			} `json:"tools"`
+		}
+		json.Unmarshal(body, &q)
+		for _, tool := range q.Tools {
+			required, there := tool.InputSchema["required"]
+			if !there || bytes.Equal(bytes.TrimSpace(required), []byte("null")) {
+				return 400, xaiNullRequired
+			}
+		}
+		return 0, ""
+	}
+	up := setup(t, provider.Anthropic, f)
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Models: []string{"grok-4.7"}, Anthropic: "http://api.x.ai"}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	addr := strings.TrimPrefix(up.URL, "http://")
+	s.client = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}}}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"fake/grok-4.7","stream":true,"max_tokens":128000,
+	"tools":[
+		{"name":"Bash","description":"Run a command","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
+		{"name":"CronList","description":"List scheduled jobs","input_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}}
+	],
+	"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("%d %s\nxAI got %s", rec.Code, rec.Body, f.got)
+	}
+	if !bytes.Contains(f.got, []byte(`"name":"CronList"`)) || !bytes.Contains(f.got, []byte(`"required":[]`)) {
+		t.Errorf("CronList did not get an empty required array: %s", f.got)
+	}
+	if !bytes.Contains(f.got, []byte(`"required":["command"]`)) {
+		t.Errorf("Bash's required array changed: %s", f.got)
+	}
+}
+
+// A body xAI takes is passed through untouched: the shapers change
 // nothing else about it, and another host's own quirks stay its own.
 func TestXaiBodyLeavesWhatItTakes(t *testing.T) {
 	plain := `{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"reasoning","id":"rs_1","encrypted_content":"gAABblob"}],"messages":[{"role":"user","content":"hi"}],"system":"prompt"}`
@@ -239,5 +296,10 @@ func TestXaiBodyLeavesWhatItTakes(t *testing.T) {
 	p := provider.Provider{ID: "other", Chat: "https://api.other/v1"}
 	if got := xaiBody(p, provider.Responses, []byte(xaiSecondTurn)); !bytes.Equal(got, []byte(xaiSecondTurn)) {
 		t.Errorf("other host shaped: %s", got)
+	}
+	anthropic := `{"model":"m","tools":[{"name":"CronList","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"hi"}]}`
+	p = provider.Provider{ID: "other", Anthropic: "https://api.other"}
+	if got := xaiBody(p, provider.Anthropic, []byte(anthropic)); !bytes.Equal(got, []byte(anthropic)) {
+		t.Errorf("other host's Anthropic body shaped: %s", got)
 	}
 }

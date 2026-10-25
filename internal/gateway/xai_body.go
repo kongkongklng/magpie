@@ -7,7 +7,7 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 )
 
-// xAI's own API (api.x.ai), wherever a Grok model is served, takes two
+// xAI's own API (api.x.ai), wherever a Grok model is served, takes three
 // things a client's wire puts in wrong, as the Grok subscription's plugin
 // shapes its bodies too (provider's grokShaped):
 //
@@ -20,6 +20,11 @@ import (
 //     them GA), which xAI's Messages answers "Invalid request content:
 //     Invalid message role." (#3392: every claude call 400ed) — each folds
 //     into the top-level system, the only place it takes the role.
+//   - Claude Code offers tools whose root schema has no required field
+//     (CronList and EnterPlanMode among them), which xAI's validator reads
+//     as null and turns away with "/required: null is not of type array" —
+//     an empty array goes in, which requires nothing, as the missing field
+//     meant.
 //
 // The relay and the translation shape alike: a refusal of custom tools
 // puts a Codex request on the translated path from the next turn on
@@ -33,11 +38,11 @@ func xaiBody(p provider.Provider, proto provider.Protocol, body []byte) []byte {
 	}
 	switch proto {
 	case provider.Responses:
-		return withoutNullReasoningContent(body)
+		body = withoutNullReasoningContent(body)
 	case provider.Anthropic:
-		return systemTurnsFolded(body)
+		body = systemTurnsFolded(body)
 	}
-	return body
+	return requiredArrays(body, proto)
 }
 
 // withoutNullReasoningContent is a Responses body with the null content of
@@ -136,4 +141,62 @@ func systemTurnsFolded(body []byte) []byte {
 		return body
 	}
 	return out
+}
+
+// requiredArrays is body with an empty required array on each tool schema
+// whose root has none (#3392). xAI's validator reads the missing field as
+// null and refuses the request.
+func requiredArrays(body []byte, proto provider.Protocol) []byte {
+	if !bytes.Contains(body, []byte(`"tools"`)) {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var m map[string]any
+	if dec.Decode(&m) != nil || m == nil {
+		return body
+	}
+	tools, _ := m["tools"].([]any)
+	if !fillRequiredArrays(proto, tools) {
+		return body
+	}
+	out, err := marshalPlain(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// fillRequiredArrays fills the root required array of each tool schema that
+// has none, and reports whether it changed any.
+func fillRequiredArrays(proto provider.Protocol, tools []any) bool {
+	changed := false
+	for _, t := range tools {
+		tm, _ := t.(map[string]any)
+		if tm == nil {
+			continue
+		}
+		if proto == provider.Responses && tm["type"] == "namespace" {
+			nested, _ := tm["tools"].([]any)
+			if fillRequiredArrays(proto, nested) {
+				changed = true
+			}
+			continue
+		}
+		var schema map[string]any
+		switch proto {
+		case provider.Anthropic:
+			schema, _ = tm["input_schema"].(map[string]any)
+		case provider.Responses:
+			schema, _ = tm["parameters"].(map[string]any)
+		}
+		if schema == nil {
+			continue
+		}
+		if required, there := schema["required"]; !there || required == nil {
+			schema["required"] = []any{}
+			changed = true
+		}
+	}
+	return changed
 }
