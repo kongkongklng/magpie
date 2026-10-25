@@ -7,7 +7,7 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 )
 
-// xAI's own API (api.x.ai), wherever a Grok model is served, takes two
+// xAI's own API (api.x.ai), wherever a Grok model is served, takes three
 // things a client's wire puts in wrong, as the Grok subscription's plugin
 // shapes its bodies too (provider's grokShaped):
 //
@@ -20,17 +20,24 @@ import (
 //     them GA), which xAI's Messages answers "Invalid request content:
 //     Invalid message role." (#3392: every claude call 400ed) — each folds
 //     into the top-level system, the only place it takes the role.
+//   - A tool's schema can say "required": null where none are (Claude
+//     Code's tools, an MCP server's among them — Anthropic's API takes
+//     it), which xAI answers "Invalid request content: Schema validation
+//     failed: [standard_violation] /required: null is not of type
+//     \"array\"" (#3392: the claude calls 400ed after the system-turn
+//     fix) — the key goes, null says none.
 //
 // The relay and the translation shape alike: a refusal of custom tools
 // puts a Codex request on the translated path from the next turn on
 // (custom_tool.go), and there is nothing to learn from either answer —
-// xAI takes no null content and no system turn at all.
+// xAI takes no null content, no system turn and no null required at all.
 
 // xaiBody shapes body as xAI's own API takes it on proto.
 func xaiBody(p provider.Provider, proto provider.Protocol, body []byte) []byte {
 	if p.Host() != "api.x.ai" {
 		return body
 	}
+	body = withoutNullToolRequired(body)
 	switch proto {
 	case provider.Responses:
 		return withoutNullReasoningContent(body)
@@ -136,4 +143,69 @@ func systemTurnsFolded(body []byte) []byte {
 		return body
 	}
 	return out
+}
+
+// withoutNullToolRequired is a body whose tool schemas carry no null
+// required (#3392). xAI validates each tool's schema as a JSON Schema
+// and refuses the null at its root or anywhere nested; a client's wire
+// puts it there where none are required (Anthropic's API takes it). The
+// schemas are found under every shape a body leaves magpie in:
+// input_schema (Anthropic), parameters (Responses) and function's
+// parameters (chat).
+func withoutNullToolRequired(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"tools"`)) || !bytes.Contains(body, []byte(`"required"`)) {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var m map[string]any
+	if dec.Decode(&m) != nil || m == nil {
+		return body
+	}
+	dirty := false
+	tools, _ := m["tools"].([]any)
+	for _, t := range tools {
+		tm, _ := t.(map[string]any)
+		if tm == nil {
+			continue
+		}
+		for _, k := range []string{"parameters", "input_schema"} {
+			if dropNullRequired(tm[k]) {
+				dirty = true
+			}
+		}
+		if fm, _ := tm["function"].(map[string]any); fm != nil {
+			if dropNullRequired(fm["parameters"]) {
+				dirty = true
+			}
+		}
+	}
+	if !dirty {
+		return body
+	}
+	out, err := marshalPlain(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// dropNullRequired deletes every "required": null in v, recursively, and
+// says whether it did; a real array of names stays as it came.
+func dropNullRequired(v any) bool {
+	obj, _ := v.(map[string]any)
+	if obj == nil {
+		return false
+	}
+	dirty := false
+	if r, there := obj["required"]; there && r == nil {
+		delete(obj, "required")
+		dirty = true
+	}
+	for _, child := range obj {
+		if dropNullRequired(child) {
+			dirty = true
+		}
+	}
+	return dirty
 }

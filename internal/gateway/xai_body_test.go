@@ -24,6 +24,7 @@ const (
 	xaiCompactionRefusal = `{"code":"invalid-argument","error":"Could not decode the compaction blob. Ensure it is unmodified from the compact response."}`
 	xaiUnknownCustom     = `Failed to deserialize the JSON body into the target type: tools[6].type: unknown variant ` + "`custom`" + `, expected one of ` + "`function`" + `, ` + "`web_search`" + `, ` + "`shell`" + `, ` + "`tool_search`"
 	xaiInvalidRole       = `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid request content: Invalid message role."}}`
+	xaiNullRequired      = `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid request content: Schema validation failed: [standard_violation] /required: null is not of type \"array\""}}`
 )
 
 // The reporter's second turn: Codex's replay of the sealed reasoning item
@@ -201,7 +202,81 @@ func TestXAIFoldsClaudesSystemTurn(t *testing.T) {
 	}
 }
 
-// A body xAI takes is passed through untouched: the two shapers change
+// #3392's third round, as kongkongklng reported it after the system-turn
+// fix: codex went through, every Claude call still 400ed xAI's schema
+// validation "Invalid request content: Schema validation failed:
+// [standard_violation] /required: null is not of type \"array\"" — a
+// tool's schema said "required": null where none were (Claude Code's own
+// tools or an MCP server's; Anthropic's API takes the null, xAI validates
+// the schema). The null required goes, root or nested; a real array of
+// names stays.
+func TestXAITakesANullRequiredToolSchema(t *testing.T) {
+	f := &fake{t: t, reply: sse(
+		`event: message_start`+"\n"+`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"grok-4.7","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`event: content_block_delta`+"\n"+`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+		`event: content_block_stop`+"\n"+`data: {"type":"content_block_stop","index":0}`,
+		`event: message_delta`+"\n"+`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`,
+		`event: message_stop`+"\n"+`data: {"type":"message_stop"}`)}
+	f.refuse = func(body []byte) (int, string) {
+		if bytes.Contains(body, []byte(`"required":null`)) {
+			return 400, xaiNullRequired
+		}
+		return 0, ""
+	}
+	up := setup(t, provider.Anthropic, f)
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Models: []string{"grok-4.7"}, Anthropic: "http://api.x.ai"}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	addr := strings.TrimPrefix(up.URL, "http://")
+	s.client = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}}}
+	// the reporter's shape: Bash's schema with its real required array
+	// beside an MCP-flavoured tool whose schema says required: null at the
+	// root and one whose nested property does (texts cut)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"fake/grok-4.7","stream":true,"max_tokens":128000,
+	"tools":[{"name":"Bash","description":"Run a command","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
+		{"name":"mcp__server__search","description":"Search","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":null}},
+		{"name":"mcp__server__nested","description":"Nested","input_schema":{"type":"object","properties":{"opts":{"type":"object","properties":{"a":{"type":"string"}},"required":null},"b":{"type":"number"}}}}],
+	"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("%d %s\nxAI got %s", rec.Code, rec.Body, f.got)
+	}
+	if bytes.Contains(f.got, []byte(`"required":null`)) {
+		t.Errorf("null required left in a tool schema: %s", f.got)
+	}
+	for _, said := range []string{`"required":["command"]`, `"query"`, `"opts"`, `"mcp__server__nested"`} {
+		if !bytes.Contains(f.got, []byte(said)) {
+			t.Errorf("xAI's schemas lost %q: %s", said, f.got)
+		}
+	}
+}
+
+// The other two shapes a tool schema leaves magpie in get the same null
+// out: Responses' parameters and chat's function.parameters.
+func TestXaiBodyDropsNullRequiredInEveryShape(t *testing.T) {
+	p := provider.Provider{ID: "fake", Chat: "https://api.x.ai/v1", Responses: "http://api.x.ai/v1"}
+	chat := `{"model":"fake/grok-4.7","tools":[{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":null}}},{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}],"messages":[]}`
+	got := xaiBody(p, provider.Chat, []byte(chat))
+	if bytes.Contains(got, []byte(`"required":null`)) {
+		t.Errorf("chat shape kept the null: %s", got)
+	}
+	if !bytes.Contains(got, []byte(`"required":["path"]`)) || !bytes.Contains(got, []byte(`"command"`)) {
+		t.Errorf("chat shape lost a real schema: %s", got)
+	}
+	responses := `{"model":"fake/grok-4.7","tools":[{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":null}}],"input":[]}`
+	got = xaiBody(p, provider.Responses, []byte(responses))
+	if bytes.Contains(got, []byte(`"required":null`)) {
+		t.Errorf("responses shape kept the null: %s", got)
+	}
+	if !bytes.Contains(got, []byte(`"cmd"`)) {
+		t.Errorf("responses shape lost a real schema: %s", got)
+	}
+}
+
+// A body xAI takes is passed through untouched: the shapers change
 // nothing else about it, and another host's own quirks stay its own.
 func TestXaiBodyLeavesWhatItTakes(t *testing.T) {
 	plain := `{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"reasoning","id":"rs_1","encrypted_content":"gAABblob"}],"messages":[{"role":"user","content":"hi"}],"system":"prompt"}`
@@ -239,5 +314,11 @@ func TestXaiBodyLeavesWhatItTakes(t *testing.T) {
 	p := provider.Provider{ID: "other", Chat: "https://api.other/v1"}
 	if got := xaiBody(p, provider.Responses, []byte(xaiSecondTurn)); !bytes.Equal(got, []byte(xaiSecondTurn)) {
 		t.Errorf("other host shaped: %s", got)
+	}
+	// a schema whose required are all real arrays keeps its bytes
+	real := `{"model":"fake/grok-4.7","tools":[{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],"messages":[]}`
+	xp := provider.Provider{ID: "fake", Chat: "https://api.x.ai/v1"}
+	if got := xaiBody(xp, provider.Chat, []byte(real)); !bytes.Equal(got, []byte(real)) {
+		t.Errorf("real required arrays changed: %s", got)
 	}
 }
