@@ -20,12 +20,14 @@ import (
 //     them GA), which xAI's Messages answers "Invalid request content:
 //     Invalid message role." (#3392: every claude call 400ed) — each folds
 //     into the top-level system, the only place it takes the role.
-//   - A tool's schema can say "required": null where none are (Claude
-//     Code's tools, an MCP server's among them — Anthropic's API takes
-//     it), which xAI answers "Invalid request content: Schema validation
-//     failed: [standard_violation] /required: null is not of type
-//     \"array\"" (#3392: the claude calls 400ed after the system-turn
-//     fix) — the key goes, null says none.
+//   - A tool's schema can say "required": null where none are, or omit
+//     the key (Claude Code's tools, an MCP server's among them —
+//     Anthropic's API takes both), which xAI answers "Invalid request
+//     content: Schema validation failed: [standard_violation]
+//     /required: null is not of type \"array\"" (#3392: the claude calls
+//     400ed after the system-turn fix) — a null key goes, and an object
+//     schema whose root omits it states the empty array that requires
+//     nothing.
 //
 // The relay and the translation shape alike: a refusal of custom tools
 // puts a Codex request on the translated path from the next turn on
@@ -38,6 +40,7 @@ func xaiBody(p provider.Provider, proto provider.Protocol, body []byte) []byte {
 		return body
 	}
 	body = withoutNullToolRequired(body)
+	body = withEmptyToolRequired(body)
 	switch proto {
 	case provider.Responses:
 		return withoutNullReasoningContent(body)
@@ -208,4 +211,79 @@ func dropNullRequired(v any) bool {
 		}
 	}
 	return dirty
+}
+
+// withEmptyToolRequired is a body whose object tool schemas state the
+// empty required array xAI expects when no argument is required (#3392).
+// Claude Code omits the key rather than writing null, which xAI validates
+// as null all the same. A schema that already states required, an array
+// included, stays as it came.
+func withEmptyToolRequired(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"tools"`)) {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var m map[string]any
+	if dec.Decode(&m) != nil || m == nil {
+		return body
+	}
+	tools, _ := m["tools"].([]any)
+	if !fillEmptyToolRequired(tools) {
+		return body
+	}
+	out, err := marshalPlain(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// fillEmptyToolRequired fills the required array of each object tool
+// schema at its root, including tools inside a Responses namespace.
+func fillEmptyToolRequired(tools []any) bool {
+	changed := false
+	for _, t := range tools {
+		tm, _ := t.(map[string]any)
+		if tm == nil {
+			continue
+		}
+		if tm["type"] == "namespace" {
+			nested, _ := tm["tools"].([]any)
+			if fillEmptyToolRequired(nested) {
+				changed = true
+			}
+			continue
+		}
+		var schemas []map[string]any
+		for _, k := range []string{"parameters", "input_schema"} {
+			if schema, _ := tm[k].(map[string]any); schema != nil {
+				schemas = append(schemas, schema)
+			}
+		}
+		if fm, _ := tm["function"].(map[string]any); fm != nil {
+			if schema, _ := fm["parameters"].(map[string]any); schema != nil {
+				schemas = append(schemas, schema)
+			}
+		}
+		for _, schema := range schemas {
+			if fillEmptyRequired(schema) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func fillEmptyRequired(schema map[string]any) bool {
+	typ, _ := schema["type"].(string)
+	_, properties := schema["properties"]
+	if typ != "object" && !properties {
+		return false
+	}
+	if required, there := schema["required"]; there && required != nil {
+		return false
+	}
+	schema["required"] = []any{}
+	return true
 }

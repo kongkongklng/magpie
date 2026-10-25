@@ -254,6 +254,75 @@ func TestXAITakesANullRequiredToolSchema(t *testing.T) {
 	}
 }
 
+// Claude Code also omits required altogether on no-argument tools such as
+// CronList and EnterPlanMode. xAI validates the missing key as null, so
+// each object schema's root gets the empty array that requires nothing.
+func TestXAITakesToolSchemaWithoutRequired(t *testing.T) {
+	f := &fake{t: t, reply: sse(
+		`event: message_start`+"\n"+`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"grok-4.7","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`event: content_block_delta`+"\n"+`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+		`event: content_block_stop`+"\n"+`data: {"type":"content_block_stop","index":0}`,
+		`event: message_delta`+"\n"+`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`,
+		`event: message_stop`+"\n"+`data: {"type":"message_stop"}`)}
+	f.refuse = func(body []byte) (int, string) {
+		var q struct {
+			Tools []struct {
+				InputSchema map[string]json.RawMessage `json:"input_schema"`
+			} `json:"tools"`
+		}
+		json.Unmarshal(body, &q)
+		for _, tool := range q.Tools {
+			required, there := tool.InputSchema["required"]
+			if !there || bytes.Equal(bytes.TrimSpace(required), []byte("null")) {
+				return 400, xaiNullRequired
+			}
+		}
+		return 0, ""
+	}
+	up := setup(t, provider.Anthropic, f)
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Models: []string{"grok-4.7"}, Anthropic: "http://api.x.ai"}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	addr := strings.TrimPrefix(up.URL, "http://")
+	s.client = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}}}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"fake/grok-4.7","stream":true,"max_tokens":128000,
+	"tools":[
+		{"name":"Bash","description":"Run a command","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
+		{"name":"CronList","description":"List scheduled jobs","input_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}},
+		{"name":"EnterPlanMode","description":"Enter plan mode","input_schema":{"type":"object","properties":{},"additionalProperties":false}}
+	],
+	"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("%d %s\nxAI got %s", rec.Code, rec.Body, f.got)
+	}
+	var sent struct {
+		Tools []struct {
+			Name        string                     `json:"name"`
+			InputSchema map[string]json.RawMessage `json:"input_schema"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(f.got, &sent); err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range sent.Tools {
+		required := string(bytes.TrimSpace(tool.InputSchema["required"]))
+		switch tool.Name {
+		case "CronList", "EnterPlanMode":
+			if required != "[]" {
+				t.Errorf("%s required = %q, want []: %s", tool.Name, required, f.got)
+			}
+		case "Bash":
+			if required != `["command"]` {
+				t.Errorf("Bash required changed to %q: %s", required, f.got)
+			}
+		}
+	}
+}
+
 // The other two shapes a tool schema leaves magpie in get the same null
 // out: Responses' parameters and chat's function.parameters.
 func TestXaiBodyDropsNullRequiredInEveryShape(t *testing.T) {
@@ -273,6 +342,24 @@ func TestXaiBodyDropsNullRequiredInEveryShape(t *testing.T) {
 	}
 	if !bytes.Contains(got, []byte(`"cmd"`)) {
 		t.Errorf("responses shape lost a real schema: %s", got)
+	}
+}
+
+// A missing required gets the same empty array in every tool shape.
+func TestXaiBodyFillsMissingRequiredInEveryShape(t *testing.T) {
+	p := provider.Provider{ID: "fake", Chat: "https://api.x.ai/v1", Responses: "http://api.x.ai/v1"}
+	for _, tc := range []struct {
+		name  string
+		proto provider.Protocol
+		body  string
+	}{
+		{"chat", provider.Chat, `{"model":"fake/grok-4.7","tools":[{"type":"function","function":{"name":"CronList","parameters":{"type":"object","properties":{}}}}],"messages":[]}`},
+		{"responses", provider.Responses, `{"model":"fake/grok-4.7","tools":[{"type":"function","name":"CronList","parameters":{"type":"object","properties":{}}}],"input":[]}`},
+	} {
+		got := xaiBody(p, tc.proto, []byte(tc.body))
+		if !bytes.Contains(got, []byte(`"required":[]`)) {
+			t.Errorf("%s shape did not get an empty required array: %s", tc.name, got)
+		}
 	}
 }
 
