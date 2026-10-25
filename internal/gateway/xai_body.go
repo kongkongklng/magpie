@@ -193,24 +193,34 @@ func withoutNullToolRequired(body []byte) []byte {
 	return out
 }
 
-// dropNullRequired deletes every "required": null in v, recursively, and
-// says whether it did; a real array of names stays as it came.
+// dropNullRequired deletes every "required": null in v, recursively —
+// through a schema's objects and its arrays alike, where a union's anyOf
+// branch or a tuple items holds one — and says whether it did; a real
+// array of names stays as it came.
 func dropNullRequired(v any) bool {
-	obj, _ := v.(map[string]any)
-	if obj == nil {
-		return false
-	}
-	dirty := false
-	if r, there := obj["required"]; there && r == nil {
-		delete(obj, "required")
-		dirty = true
-	}
-	for _, child := range obj {
-		if dropNullRequired(child) {
+	switch t := v.(type) {
+	case map[string]any:
+		dirty := false
+		if r, there := t["required"]; there && r == nil {
+			delete(t, "required")
 			dirty = true
 		}
+		for _, child := range t {
+			if dropNullRequired(child) {
+				dirty = true
+			}
+		}
+		return dirty
+	case []any:
+		dirty := false
+		for _, child := range t {
+			if dropNullRequired(child) {
+				dirty = true
+			}
+		}
+		return dirty
 	}
-	return dirty
+	return false
 }
 
 // withEmptyToolRequired is a body whose object tool schemas state the

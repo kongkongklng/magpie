@@ -234,12 +234,15 @@ func TestXAITakesANullRequiredToolSchema(t *testing.T) {
 	}}}
 	// the reporter's shape: Bash's schema with its real required array
 	// beside an MCP-flavoured tool whose schema says required: null at the
-	// root and one whose nested property does (texts cut)
+	// root, one whose nested property does, and two whose null sits under
+	// an array — a zod union's anyOf branch and a tuple items (texts cut)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"fake/grok-4.7","stream":true,"max_tokens":128000,
 	"tools":[{"name":"Bash","description":"Run a command","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
 		{"name":"mcp__server__search","description":"Search","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":null}},
-		{"name":"mcp__server__nested","description":"Nested","input_schema":{"type":"object","properties":{"opts":{"type":"object","properties":{"a":{"type":"string"}},"required":null},"b":{"type":"number"}}}}],
+		{"name":"mcp__server__nested","description":"Nested","input_schema":{"type":"object","properties":{"opts":{"type":"object","properties":{"a":{"type":"string"}},"required":null},"b":{"type":"number"}}}},
+		{"name":"mcp__server__union","description":"Union","input_schema":{"type":"object","properties":{"filter":{"anyOf":[{"type":"object","properties":{"id":{"type":"string"}},"required":null},{"type":"string"}]}}}},
+		{"name":"mcp__server__pair","description":"Pair","input_schema":{"type":"object","items":[{"type":"object","properties":{"first":{"type":"string"}},"required":null}],"type":"object"}}],
 	"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)))
 	if rec.Code != 200 {
 		t.Fatalf("%d %s\nxAI got %s", rec.Code, rec.Body, f.got)
@@ -247,7 +250,7 @@ func TestXAITakesANullRequiredToolSchema(t *testing.T) {
 	if bytes.Contains(f.got, []byte(`"required":null`)) {
 		t.Errorf("null required left in a tool schema: %s", f.got)
 	}
-	for _, said := range []string{`"required":["command"]`, `"query"`, `"opts"`, `"mcp__server__nested"`} {
+	for _, said := range []string{`"required":["command"]`, `"query"`, `"opts"`, `"mcp__server__nested"`, `"anyOf"`, `"first"`} {
 		if !bytes.Contains(f.got, []byte(said)) {
 			t.Errorf("xAI's schemas lost %q: %s", said, f.got)
 		}
