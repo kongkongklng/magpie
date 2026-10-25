@@ -96,6 +96,12 @@ func rawTokens(b json.RawMessage) int { return (len(b) + 3) / 4 }
 // counts for a 1092×1092 one.
 const imageTokens = 1600
 
+// promptBuilder reads a body through decodeJSONView: what it keeps of
+// the body, a piece's raw JSON, lives only as long as the builder, which
+// the body outlives (promptOf's request; promptPieces' kept body, its
+// pieces read out before PromptText returns). Each item's content and
+// output copied out was 0.8 of the 14.9 MB a 680 KB Codex request
+// allocated (#3383).
 type promptBuilder struct {
 	parts map[string]map[string]*PromptItem
 	turn  int
@@ -543,10 +549,10 @@ func filesOfCommand(cmd string) []string {
 func callOf(name string, input []byte) toolCall {
 	c := toolCall{name: name}
 	var args map[string]json.RawMessage
-	_ = decodeJSON(input, &args)
+	_ = decodeJSONView(input, &args)
 	str := func(k string) string {
 		var s string
-		if decodeJSON(args[k], &s) == nil {
+		if decodeJSONView(args[k], &s) == nil {
 			return s
 		}
 		return ""
@@ -565,7 +571,7 @@ func callOf(name string, input []byte) toolCall {
 	}
 	if cmd == "" {
 		var argv []string
-		if decodeJSON(args["command"], &argv) == nil {
+		if decodeJSONView(args["command"], &argv) == nil {
 			cmd = strings.Join(argv, " ")
 		}
 	}
@@ -645,11 +651,11 @@ type rawBlock struct {
 // blocksOf reads content that is a string or a list of blocks.
 func blocksOf(c json.RawMessage) []rawBlock {
 	var s string
-	if decodeJSON(c, &s) == nil {
+	if decodeJSONView(c, &s) == nil {
 		return []rawBlock{{Type: "text", Text: s}}
 	}
 	var bs []rawBlock
-	_ = decodeJSON(c, &bs)
+	_ = decodeJSONView(c, &bs)
 	return bs
 }
 
@@ -662,7 +668,7 @@ func (b *promptBuilder) anthropic(body []byte) bool {
 		} `json:"messages"`
 		Tools []json.RawMessage `json:"tools"`
 	}
-	if decodeJSON(body, &req) != nil {
+	if decodeJSONView(body, &req) != nil {
 		return false
 	}
 	for _, s := range blocksOf(req.System) {
@@ -676,7 +682,7 @@ func (b *promptBuilder) anthropic(body []byte) bool {
 		var d struct {
 			Name string `json:"name"`
 		}
-		_ = decodeJSON(t, &d)
+		_ = decodeJSONView(t, &d)
 		b.tool(d.Name, rawTokens(t), t)
 	}
 	for _, m := range req.Messages {
@@ -813,19 +819,19 @@ func (b *promptBuilder) responses(body []byte) bool {
 		Tools        []json.RawMessage `json:"tools"`
 		Previous     string            `json:"previous_response_id"`
 	}
-	if decodeJSON(body, &req) != nil {
+	if decodeJSONView(body, &req) != nil {
 		return false
 	}
 	b.held = req.Previous != ""
 	var ins string
-	if decodeJSON(req.Instructions, &ins) == nil && ins != "" {
+	if decodeJSONView(req.Instructions, &ins) == nil && ins != "" {
 		b.systemText(ins, "prompt")
 	}
 	for _, t := range req.Tools {
 		b.responsesTool(t)
 	}
 	var s string
-	if decodeJSON(req.Input, &s) == nil {
+	if decodeJSONView(req.Input, &s) == nil {
 		b.newTurn()
 		b.userText(s)
 		return true
@@ -846,7 +852,7 @@ func (b *promptBuilder) responsesTool(t json.RawMessage) {
 			Name string `json:"name"`
 		} `json:"function"`
 	}
-	_ = decodeJSON(t, &d)
+	_ = decodeJSONView(t, &d)
 	name := d.Name
 	if name == "" && d.Function != nil {
 		name = d.Function.Name
@@ -895,7 +901,7 @@ func (b *promptBuilder) responsesItem(raw json.RawMessage) {
 		Encrypted string          `json:"encrypted_content"`
 		Action    json.RawMessage `json:"action"`
 	}
-	if decodeJSON(raw, &it) != nil {
+	if decodeJSONView(raw, &it) != nil {
 		return
 	}
 	if it.Type == "" && it.Role != "" {
@@ -957,7 +963,7 @@ func (b *promptBuilder) responsesItem(raw json.RawMessage) {
 	case "function_call_output", "custom_tool_call_output", "local_shell_call_output", "tool_search_output":
 		n := 0
 		var s string
-		if decodeJSON(it.Output, &s) == nil {
+		if decodeJSONView(it.Output, &s) == nil {
 			n = tokensOf(s)
 		} else {
 			var texts []string
@@ -992,7 +998,7 @@ type rPart struct {
 
 func responsesContent(c json.RawMessage) []rPart {
 	var s string
-	if decodeJSON(c, &s) == nil {
+	if decodeJSONView(c, &s) == nil {
 		return []rPart{{text: s}}
 	}
 	var ps []struct {
@@ -1000,7 +1006,7 @@ func responsesContent(c json.RawMessage) []rPart {
 		Text     string          `json:"text"`
 		ImageURL json.RawMessage `json:"image_url"`
 	}
-	_ = decodeJSON(c, &ps)
+	_ = decodeJSONView(c, &ps)
 	out := make([]rPart, 0, len(ps))
 	for _, p := range ps {
 		out = append(out, rPart{text: p.Text, image: p.Type == "input_image" || p.Type == "input_file" || p.Type == "image_url", src: p.ImageURL})
@@ -1027,7 +1033,7 @@ func (b *promptBuilder) chatCompletions(body []byte) bool {
 		} `json:"messages"`
 		Tools []json.RawMessage `json:"tools"`
 	}
-	if decodeJSON(body, &req) != nil {
+	if decodeJSONView(body, &req) != nil {
 		return false
 	}
 	for _, t := range req.Tools {
@@ -1113,7 +1119,7 @@ func (b *promptBuilder) gemini(body []byte) bool {
 			Decls []json.RawMessage `json:"functionDeclarations"`
 		} `json:"tools"`
 	}
-	if decodeJSON(body, &req) != nil {
+	if decodeJSONView(body, &req) != nil {
 		return false
 	}
 	if req.System != nil {
@@ -1126,7 +1132,7 @@ func (b *promptBuilder) gemini(body []byte) bool {
 			var n struct {
 				Name string `json:"name"`
 			}
-			_ = decodeJSON(d, &n)
+			_ = decodeJSONView(d, &n)
 			b.tool(n.Name, rawTokens(d), d)
 		}
 	}
